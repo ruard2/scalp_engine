@@ -1,0 +1,14 @@
+# Data / state files
+*.csv
+*.log
+*.json
+__pycache__/
+*.pyc
+*.pyo
+backtest_folder/
+
+# Sensitive
+config.py
+scalp_config.py
+session_token.json
+v3_config.py
