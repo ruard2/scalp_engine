@@ -59,6 +59,13 @@ from lightstreamer_receiver import LightstreamerReceiver
 from trade_execution import TradeExecutor
 from scalp_position_api import PositionCloser
 from open_orders_feed_module import PositionManagementModule
+from risk_controls import (
+    advance_bar as advance_risk_bar,
+    ensure_risk_state,
+    entry_allowed as risk_entry_allowed,
+    record_close as record_risk_close,
+    status as risk_status,
+)
 
 # ── Import v6 pipeline (same folder as live_engine.py) ──────────────────────
 from fase1_2_v6 import (
@@ -101,7 +108,6 @@ for _h in _root.handlers:
 for _lib in ("urllib3", "requests", "lightstreamer", "websocket", "http.client"):
     logging.getLogger(_lib).setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
-log.info(f"=== ENGINE START === Log: {_LOG_PATH}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +145,27 @@ def get_adaptive_sl_mult(profile_key: str, atr_rank: float) -> float:
         return 4.0
     return PROFILES[profile_key].sl_atr_mult   # 2.5 from profile
 
+
+def _update_reversal_strike(state: Dict, direction: str, pnl: float):
+    """Set/clear a reversal strike after each trade close.
+
+    A strike is set when a trade fails AND its direction differs from the
+    prior closed trade — i.e. a direction-change attempt just failed.
+    While active, a second reversal entry in that direction requires both
+    daily_bias == direction AND local != ReversalCandidate.
+    A profitable close in any direction clears the strike.
+    """
+    last = state.get("last_trade_direction")
+    if pnl < 0 and last is not None and last != direction:
+        state["reversal_strike"] = {"direction": direction}
+        log.info(f"[STRIKE] Reversal strike SET on {direction} "
+                 f"(direction change from {last} failed, pnl={pnl:+.1f}p)")
+    elif pnl >= 0 and state.get("reversal_strike"):
+        log.info(f"[STRIKE] Strike CLEARED — {direction} trade profitable "
+                 f"(pnl={pnl:+.1f}p)")
+        state["reversal_strike"] = None
+    state["last_trade_direction"] = direction
+
 # ── Bounce exit config (backtest 2026-06-16) ─────────────────────────────────
 # After a hard SL triggers: hold position up to 2 bars, wait for price to
 # recover. Safety floor at SL+6p adverse closes immediately if move continues.
@@ -171,6 +198,9 @@ def fetch_bars(n: int = BARS_NEEDED) -> pd.DataFrame:
     )
     headers = {"Session": token, "UserName": username}
     resp    = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code == 401:
+        headers["Session"] = session_manager.refresh_session_token()
+        resp = requests.get(url, headers=headers, timeout=15)
     if resp.status_code != 200:
         raise RuntimeError(f"Fetch failed: {resp.status_code} {resp.text[:200]}")
 
@@ -256,15 +286,32 @@ def load_state() -> Dict:
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE) as f:
-                return json.load(f)
+                state = json.load(f)
+                ensure_risk_state(state)
+                return state
         except Exception:
             pass
-    return {"open_trades": {}, "bounce_pending": {}, "pending_signal": None}
+    state = {
+        "open_trades": {},
+        "bounce_pending": {},
+        "pending_signal": None,
+        "reversal_strike": None,
+        "last_trade_direction": None,
+    }
+    ensure_risk_state(state)
+    return state
 
 
 def save_state(state: Dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
+    with _state_save_lock:
+        with _state_lock:
+            payload = json.dumps(state, indent=2, default=str)
+        temp_path = STATE_FILE.with_suffix(".tmp")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, STATE_FILE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,42 +322,59 @@ _ls_receiver: Optional[LightstreamerReceiver] = None
 # Shared lock: acquired by TickExitMonitor on each tick poll (~1ms),
 # and by the main bar loop while touching state (~2s per 10-min cycle).
 _state_lock = threading.Lock()
+_state_save_lock = threading.Lock()
 
 # Tick-based exit monitor (started after ls_connect)
 _tick_monitor = None
 
 
-def _write_session_token_json(token: str):
-    """LightstreamerReceiver reads session_token.json from its working dir."""
-    path = Path(__file__).parent / "session_token.json"
-    with open(path, "w") as f:
-        json.dump({"session_token": token}, f)
-
-
 def ls_connect() -> bool:
-    """Connect persistent Lightstreamer receiver — identical to scalp_sys startup."""
+    """Connect Lightstreamer and publish the new receiver to all consumers."""
     global _ls_receiver
-    try:
-        if _ls_receiver is not None:
-            try: _ls_receiver.disconnect()
-            except Exception: pass
-            _ls_receiver = None
+    if _ls_receiver is not None:
+        try:
+            _ls_receiver.disconnect()
+        except Exception:
+            pass
+        _ls_receiver = None
 
-        token = session_manager.get_session_token()
-        _write_session_token_json(token)
-        log.info("[LS] Connecting to Lightstreamer (push.cityindex.com)...")
-        _ls_receiver = LightstreamerReceiver(initial_market_ids=[int(MARKET_ID)])
+    for attempt in range(2):
+        candidate = None
+        try:
+            token = (
+                session_manager.get_session_token()
+                if attempt == 0
+                else session_manager.refresh_session_token()
+            )
+            log.info("[LS] Connecting to Lightstreamer (push.cityindex.com)...")
+            candidate = LightstreamerReceiver(
+                initial_market_ids=[int(MARKET_ID)],
+                session_token=token,
+                max_connect_attempts=3,
+            )
+            tick = candidate.fetch_market_data_one(MARKET_ID, timeout_secs=8)
+            if tick:
+                _ls_receiver = candidate
+                if _tick_monitor is not None:
+                    _tick_monitor.set_ls_receiver(candidate)
+                log.info(f"[LS] Connected OK — Bid={float(tick['Bid']):.5f}  "
+                         f"Offer={float(tick['Offer']):.5f}  "
+                         f"AuditId={tick.get('AuditId','')}")
+                return True
+            log.warning("[LS] Connected but no tick within 8s.")
+        except Exception as e:
+            log.error(f"[LS] Connection attempt {attempt + 1} failed: {e}")
+        finally:
+            if candidate is not None and candidate is not _ls_receiver:
+                try:
+                    candidate.disconnect()
+                except Exception:
+                    pass
 
-        tick = _ls_receiver.fetch_market_data_one(MARKET_ID, timeout_secs=8)
-        if tick:
-            log.info(f"[LS] Connected OK — Bid={float(tick['Bid']):.5f}  "
-                     f"Offer={float(tick['Offer']):.5f}  AuditId={tick.get('AuditId','')}")
-            return True
-        log.warning("[LS] Connected but no tick within 8s.")
-        return False
-    except Exception as e:
-        log.error(f"[LS] Connection failed: {e}")
-        return False
+        if attempt == 0:
+            log.warning("[LS] Refreshing CIAPI token and retrying once.")
+
+    return False
 
 
 def ls_get_tick() -> Optional[Dict]:
@@ -401,7 +465,12 @@ def close_order(order_id: str, entry_direction: str,
 
     try:
         tok    = session_manager.get_session_token()
-        closer = PositionCloser(tok, tradingAccountID, username)
+        closer = PositionCloser(
+            tok,
+            tradingAccountID,
+            username,
+            perform_last_check=False,
+        )
         success = closer.close_position(
             order_id    = int(order_id),
             direction   = entry_direction,
@@ -508,7 +577,8 @@ def log_trade(record: Dict):
 # ─────────────────────────────────────────────────────────────────────────────
 def print_dashboard(classified: pd.DataFrame, open_trades: Dict,
                     daily_bias: str, session: str, bar_time: datetime,
-                    bounce_pending: Optional[Dict] = None):
+                    bounce_pending: Optional[Dict] = None,
+                    state: Optional[Dict] = None):
     last    = classified.iloc[-1]
     now_utc = datetime.now(timezone.utc)
 
@@ -541,6 +611,9 @@ def print_dashboard(classified: pd.DataFrame, open_trades: Dict,
     print()
     print(f"  Daily bias  : {daily_bias}  |  Session: {session}")
     print(f"  Dir score   : {last['dir_score']:.1f}  |  Efficiency: {last['efficiency']:.1f}")
+    strike = state.get("reversal_strike") if state else None
+    if strike:
+        print(f"  *** REVERSAL STRIKE : {strike['direction']} — need bias={strike['direction']}+no RC ***")
     print()
 
     # Entry signal check — show each rule pass/fail
@@ -550,7 +623,12 @@ def print_dashboard(classified: pd.DataFrame, open_trades: Dict,
     combo   = f"{d}_{e}_{loc}"
     profile = get_profile_key(d, e, loc)
     allowed = entry_allowed(d, e, session, bar_time.hour)
-    signal  = allowed and profile is not None
+    risk_ok, risk_reason = (
+        risk_entry_allowed(state, d, last, now_utc)
+        if state is not None and d in ("Bull", "Bear")
+        else (True, "not evaluated")
+    )
+    signal  = allowed and profile is not None and risk_ok
 
     print(f"  SIGNAL      : {'>>> ACTIVE <<<' if signal else 'none'}", end="")
     if signal:
@@ -567,6 +645,21 @@ def print_dashboard(classified: pd.DataFrame, open_trades: Dict,
     print(f"    Midnight buffer  : {'FAIL  <- 23:00-01:00 UTC blocked' if _h in (23,0) else 'PASS'}")
     print(f"    Profile exists   : {'PASS  profile=' + profile if profile else 'FAIL  <- no profile for this combo'}")
     print(f"    Daily bias       : {daily_bias}  (info only)")
+    _ds = float(last["dir_score"]) if pd.notna(last.get("dir_score")) else 0.0
+    _loc = str(last["local"])
+    if _loc in ("Pullback", "ReversalCandidate") and abs(_ds) < 20.0:
+        print(f"    Dir-score gate   : FAIL  <- {_loc} blocked (dir_score={_ds:.1f}, need |score|>=20)")
+    else:
+        print(f"    Dir-score gate   : PASS  dir_score={_ds:.1f}")
+    print(f"    Risk controls    : {'PASS' if risk_ok else 'FAIL'}  {risk_reason}")
+
+    if state is not None:
+        rs = risk_status(state)
+        print(
+            f"    Day realized     : "
+            f"{rs['daily_realized_pips']:+.1f}p / "
+            f"{rs['daily_realized_r']:+.2f}R"
+        )
 
     print()
     print(f"  OPEN TRADES ({len(open_trades)}):")
@@ -627,7 +720,38 @@ def run(paper: bool = False):
                 continue
             direction_label = "Bull" if dirn == "buy" else "Bear"
             combo_key = f"{direction_label}_restored_{oid}"
-            if oid not in [str(t.get("order_id","")) for t in state["open_trades"].values()]:
+            local_trade = next(
+                (
+                    trade
+                    for bucket in ("open_trades", "bounce_pending")
+                    for trade in state.get(bucket, {}).values()
+                    if str(trade.get("order_id", "")) == oid
+                ),
+                None,
+            )
+            if local_trade is not None:
+                old_entry = float(local_trade.get("entry_price", entry))
+                delta = entry - old_entry
+                if abs(delta) > 0.0000001:
+                    local_trade["entry_price"] = entry
+                    for field_name in (
+                        "sl_price",
+                        "tp_price",
+                        "best_price",
+                        "trail_stop",
+                        "sl_trigger",
+                        "safety_floor",
+                        "bounce_trail",
+                        "best_recovery",
+                    ):
+                        value = local_trade.get(field_name)
+                        if value not in (None, 0, 0.0):
+                            local_trade[field_name] = float(value) + delta
+                    log.warning(
+                        f"  Corrected order={oid} to broker fill "
+                        f"{old_entry:.5f} -> {entry:.5f}"
+                    )
+            else:
                 state["open_trades"][combo_key] = {
                     "order_id":      oid,
                     "direction":     direction_label,
@@ -673,6 +797,8 @@ def run(paper: bool = False):
         bounce_min_pips=BOUNCE_MIN_PIPS,
         bounce_trail_pips=BOUNCE_TRAIL_PIPS,
         min_trail_lock_p=MIN_TRAIL_LOCK_PIPS,
+        state_changed_fn=lambda: save_state(state),
+        on_trade_close_fn=lambda direction, pnl: _update_reversal_strike(state, direction, pnl),
     )
     _tick_monitor._reconnect_fn = ls_connect  # watchdog calls this on stale feed
     _tick_monitor.start()
@@ -725,6 +851,9 @@ def run(paper: bool = False):
             log.debug(f"  LOCAL      : {last['local']}  conf={last['local_conf']:.0f}")
             log.debug(f"  ATR={last['atr']*10000:.1f}p  atr_rank={last['atr_rank']:.0f}%  efficiency={last['efficiency']:.1f}")
             log.debug(f"  session={session}  daily_bias={daily_bias}  open_trades={len(state['open_trades'])}")
+            if len(classified) >= 2:
+                with _state_lock:
+                    advance_risk_bar(state, last, classified.iloc[-2])
 
             # ── 3a. Bounce-pending: OHLC timeout only ─────────────────────────
             # Tick monitor handles BounceSafety/BounceProfit/BounceTrail in
@@ -768,7 +897,25 @@ def run(paper: bool = False):
                     str(bs.get("order_id", "0")), bs["direction"], bs["entry_price"],
                     close_reason, paper)
                 if success:
-                    del state["bounce_pending"][bkey]
+                    with _state_lock:
+                        if state["bounce_pending"].get(bkey) is bs:
+                            risk_result = record_risk_close(
+                                state,
+                                bs,
+                                pnl,
+                                close_price,
+                                datetime.now(timezone.utc),
+                            )
+                            state["bounce_pending"].pop(bkey, None)
+                            _update_reversal_strike(state, bs["direction"], pnl)
+                        else:
+                            risk_result = None
+                    if risk_result:
+                        log.info(
+                            f"  [RISK] Realized={risk_result['realized_r']:+.2f}R  "
+                            f"day={risk_result['daily_realized_r']:+.2f}R  "
+                            f"gate={'ARMED' if risk_result['gate_armed'] else 'clear'}"
+                        )
                 log_trade({
                     "type": "CLOSE",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -835,7 +982,25 @@ def run(paper: bool = False):
                     trade["entry_price"], reason, paper)
 
                 if success:
-                    state["open_trades"].pop(key, None)
+                    with _state_lock:
+                        if state["open_trades"].get(key) is trade:
+                            risk_result = record_risk_close(
+                                state,
+                                trade,
+                                pnl,
+                                close_price,
+                                datetime.now(timezone.utc),
+                            )
+                            state["open_trades"].pop(key, None)
+                            _update_reversal_strike(state, trade["direction"], pnl)
+                        else:
+                            risk_result = None
+                    if risk_result:
+                        log.info(
+                            f"  [RISK] Realized={risk_result['realized_r']:+.2f}R  "
+                            f"day={risk_result['daily_realized_r']:+.2f}R  "
+                            f"gate={'ARMED' if risk_result['gate_armed'] else 'clear'}"
+                        )
                 else:
                     log.warning(f"  [EXIT] Close failed — keeping {key} in state")
 
@@ -908,12 +1073,45 @@ def run(paper: bool = False):
                     ps_dir = ps["direction"]
                     ps_env = ps["environment"]
                     ps_pk  = ps["profile_key"]
+                    with _state_lock:
+                        risk_ok, risk_reason = risk_entry_allowed(
+                            state, ps_dir, last, now_utc
+                        )
                     confirmed = (
                         direction == ps_dir
                         and environment not in ("Range", "Compression")
                         and entry_allowed(direction, environment, session, hour)
                         and profile_key is not None
+                        and risk_ok
                     )
+                    # Dir-score gate: Pullback/RC in a near-zero-conviction trend fail
+                    # consistently. Backtest (16 mnd): |dir_score|<20 on Pullback/RC
+                    # = avg -2.56p, -138p total. Filter saves +142p, DD -110p.
+                    if confirmed and ps["local"] in ("Pullback", "ReversalCandidate"):
+                        ds = ps.get("dir_score", 0.0)
+                        if abs(ds) < 20.0:
+                            log.info(
+                                f"[DIR-GATE] Entry blocked — {ps['local']} in weak trend: "
+                                f"dir_score={ds:.1f} (|score|<20 threshold)"
+                            )
+                            confirmed = False
+                            state["pending_signal"] = None
+
+                    # Reversal strike: if a direction-change trade just failed,
+                    # require daily_bias to explicitly confirm AND local != RC
+                    if confirmed:
+                        strike = state.get("reversal_strike")
+                        if strike and ps_dir == strike["direction"]:
+                            bias_ok  = daily_bias == ps_dir
+                            local_ok = ps["local"] != "ReversalCandidate"
+                            if not bias_ok or not local_ok:
+                                log.info(
+                                    f"[STRIKE] Entry blocked — reversal strike on {ps_dir}: "
+                                    f"daily_bias={daily_bias} (need {ps_dir}), "
+                                    f"local={ps['local']} ({'ok' if local_ok else 'RC blocked'})"
+                                )
+                                confirmed = False
+                                state["pending_signal"] = None
                     if confirmed:
                         log.info(f"ENTRY CONFIRMED: {ps_dir}_{ps_env} held for 2 bars "
                                  f"→ entering now  [{PROFILES[ps_pk].name}]")
@@ -926,6 +1124,8 @@ def run(paper: bool = False):
                     else:
                         log.info(f"  -> Pending signal {ps_dir}_{ps_env} NOT confirmed "
                                  f"(now: {direction}_{environment}) — discarded")
+                        if not risk_ok:
+                            log.info(f"  -> Risk control: {risk_reason}")
                         state["pending_signal"] = None
                         # Fall through: check if current bar is a fresh signal
                         ps = None
@@ -944,15 +1144,26 @@ def run(paper: bool = False):
                     elif profile_key is None:
                         log.info(f"  -> No signal: no profile for {combo_key}")
                     else:
-                        log.info(f"  -> SIGNAL PENDING (waiting 1 bar to confirm): "
-                                 f"{combo_key}  [{PROFILES[profile_key].name}]")
-                        state["pending_signal"] = {
-                            "direction":   direction,
-                            "environment": environment,
-                            "local":       local_lbl,
-                            "profile_key": profile_key,
-                            "bar_time":    bar_time.isoformat(),
-                        }
+                        with _state_lock:
+                            risk_ok, risk_reason = risk_entry_allowed(
+                                state, direction, last, now_utc
+                            )
+                        if not risk_ok:
+                            log.info(
+                                f"  -> No signal: risk control blocked "
+                                f"{direction}: {risk_reason}"
+                            )
+                        else:
+                            log.info(f"  -> SIGNAL PENDING (waiting 1 bar to confirm): "
+                                     f"{combo_key}  [{PROFILES[profile_key].name}]")
+                            state["pending_signal"] = {
+                                "direction":   direction,
+                                "environment": environment,
+                                "local":       local_lbl,
+                                "profile_key": profile_key,
+                                "bar_time":    bar_time.isoformat(),
+                                "dir_score":   float(last["dir_score"]) if pd.notna(last.get("dir_score")) else 0.0,
+                            }
 
             if do_entry:
                 # Use the signal's direction/profile (may differ from current bar's)
@@ -1019,6 +1230,9 @@ def run(paper: bool = False):
                         "session": session,
                         "order_id": order_id,
                         "paper": paper,
+                        "dir_score": round(float(last["dir_score"]), 1) if pd.notna(last.get("dir_score")) else None,
+                        "efficiency": round(float(last["efficiency"]), 1) if pd.notna(last.get("efficiency")) else None,
+                        "dir_conf": round(float(last["direction_conf"]), 0) if pd.notna(last.get("direction_conf")) else None,
                     })
 
             # ── 5. Save state ──────────────────────────────────────────────
@@ -1027,7 +1241,8 @@ def run(paper: bool = False):
 
             # ── 6. Dashboard ───────────────────────────────────────────────
             print_dashboard(classified, state["open_trades"], daily_bias, session, bar_time,
-                            bounce_pending=state.get("bounce_pending", {}))
+                            bounce_pending=state.get("bounce_pending", {}),
+                            state=state)
 
             # ── 7. Sleep until next 10-min bar, refreshing price every 5s ──
             now = datetime.now(timezone.utc)

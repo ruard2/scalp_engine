@@ -195,6 +195,72 @@ hoge volatiliteit is met adaptieve SL het meest winstgevend, niet het meest geva
 
 ---
 
+## 11. 2026-06-24: Reversal Strike + Dir-score gate voor Pullback/RC
+
+### Aanleiding
+Analyse van donderdag/vrijdag verliezen (2026-06-17/18): drie opeenvolgende grote verliezen
+(-22.9p, -28.5p, -18.9p) door twee afzonderlijke logische fouten.
+
+---
+
+### Reversal Strike (`live_engine.py` + `tick_exit_monitor.py`)
+
+**Probleem:** Na een mislukte direction-change trade ging de engine onmiddellijk opnieuw
+dezelfde kant in — zonder hogere drempel. Op vrijdag 18 juni sloot een Bear-trade op -22.9p
+(DirectionFlip), waarna de engine twee keer Bull inging (-28.5p en -18.9p), terwijl de
+markt nog steeds daalde.
+
+**Oplossing:** `state["reversal_strike"]` — actief zodra een trade sluit met verlies EN
+de richting verschilt van de vorige afgesloten trade.
+
+Zolang de strike actief is, eist een nieuwe entry in dezelfde draaiende richting:
+1. `daily_bias == entry_direction` (niet Mixed)
+2. `local != ReversalCandidate`
+
+De strike wist bij de eerste winstgevende trade in welke richting dan ook.
+
+**Bestanden:** `_update_reversal_strike()` in `live_engine.py`; callback `on_trade_close_fn`
+doorgegeven aan `TickExitMonitor` zodat alle closes (tick + OHLC) de strike bijwerken.
+Dashboard toont `*** REVERSAL STRIKE : Bull/Bear ***` wanneer actief.
+
+---
+
+### Dir-score gate (`live_engine.py`)
+
+**Probleem:** Pullback- en ReversalCandidate-entries in een zwakke trend falen consistent.
+Analyse van 16 maanden data: `dir_score` in de range 0–20 bij Pullback/RC = gemiddeld
+**-2.56p per trade, -138p totaal** (54 trades).
+
+**Backtest resultaat (`backtest_pullback_filter.py`):**
+
+| Variant | Trades | Totaal P&L | Gem/trade | Win% | DD |
+|---|---|---|---|---|---|
+| Baseline | 3101 | +1120.8p | +0.36p | 83.0% | -580.8p |
+| \|dir_score\| < 20 geblokkeerd | 3059 | +1263.6p | +0.41p | 83.0% | -470.0p |
+| **Verschil** | -42 | **+142.8p** | +0.05p | = | **+110.8p** |
+
+Slechts 42 trades geblokkeerd over 16 maanden — zeer selectief.
+
+**Logica:** `dir_score` dicht bij nul betekent dat de richting-classifier nauwelijks
+overtuiging heeft. Een Pullback-entry (tegenstroom) in zo'n zwakke trend heeft geen
+momentum achter zich en eindigt often als de echte keer. Bij sterke `dir_score`
+(bijv. -70 of +60) werken Pullback-entries wél omdat het onderliggende momentum
+de dip absorbeert.
+
+**Implementatie:** Check bij entry-bevestiging (1-bar delay, stap 4):
+```python
+if ps["local"] in ("Pullback", "ReversalCandidate") and abs(ps["dir_score"]) < 20.0:
+    # entry geblokkeerd — [DIR-GATE]
+```
+`dir_score` wordt opgeslagen in `state["pending_signal"]` op het moment van signaal.
+Dashboard toont `Dir-score gate: FAIL` wanneer het signaal geblokkeerd zou worden.
+
+**Noot:** Deze filter vangt zwakke-trend Pullback-fouten. De aparte failure-mode —
+Pullback in een *sterke maar uitgeputte* trend (bijv. 12:50 juni 24, dir_score=-85) —
+vereist een apart mechanisme (trend exhaustion tracking, nog te implementeren).
+
+---
+
 ## Eerder deze week (context, 2026-06-10/11)
 
 - Logging-fix: `config.py` riep `logging.basicConfig()` aan bij import waardoor
