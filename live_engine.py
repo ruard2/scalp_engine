@@ -613,9 +613,10 @@ def update_stats_json(pnl_pips: float, quantity: float, close_price: float,
                 "commission_eur": 0.0, "net_eur": 0.0,
             })
             entry["trades"]         += 1
-            entry["gross_pips"]     = round(entry["gross_pips"]     + pnl_pips,       2)
-            entry["commission_eur"] = round(entry["commission_eur"] + commission_eur, 4)
-            entry["net_eur"]        = round(entry["net_eur"]        + net_eur,        4)
+            entry["gross_pips"]     = round(entry.get("gross_pips", 0.0)     + pnl_pips,       2)
+            entry["gross_eur"]      = round(entry.get("gross_eur",  0.0)     + gross_eur,      4)
+            entry["commission_eur"] = round(entry.get("commission_eur", 0.0) + commission_eur, 4)
+            entry["net_eur"]        = round(entry.get("net_eur",  0.0)       + net_eur,        4)
 
         stats["last_updated"] = ts.isoformat()
 
@@ -763,7 +764,7 @@ def print_dashboard(classified: pd.DataFrame, open_trades: Dict,
                 if not e:
                     return "n/a"
                 return (f"{e['net_eur']:+.2f}€ net  "
-                        f"({e['trades']}tr  gross={e.get('gross_eur', e.get('gross_pips', 0)):+.2f}€  "
+                        f"({e['trades']}tr  gross={e.get('gross_eur', 0.0):+.2f}€  "
                         f"comm={e['commission_eur']:+.2f}€)")
             print(f"  NET P&L")
             print(f"    Today  {_day_key:<12}: {_fmt('daily',   _day_key)}")
