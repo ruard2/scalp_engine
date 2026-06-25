@@ -89,6 +89,7 @@ NY_END       = 21
 
 _HERE        = Path(__file__).parent          # always v6_engine folder, regardless of cwd
 LOG_FILE     = _HERE / "live_engine_log.csv"
+STATS_FILE   = _HERE / "live_stats.json"
 STATE_FILE   = _HERE / "live_trades_state.json"
 _LOG_PATH    = _HERE / "live_engine.log"
 
@@ -323,6 +324,7 @@ _ls_receiver: Optional[LightstreamerReceiver] = None
 # and by the main bar loop while touching state (~2s per 10-min cycle).
 _state_lock = threading.Lock()
 _state_save_lock = threading.Lock()
+_stats_lock = threading.Lock()
 
 # Tick-based exit monitor (started after ls_connect)
 _tick_monitor = None
@@ -417,6 +419,7 @@ def get_current_price(paper: bool = False) -> Tuple[float, float, str]:
 # Order execution — uses EXACT same classes as scalp_sys, zero deviation
 # ─────────────────────────────────────────────────────────────────────────────
 QUANTITY = 1000
+COMMISSION_PER_1K_EUR = 0.10   # EUR per 1000-unit round-trip (CityIndex: 0.05 open + 0.05 close)
 
 
 def open_order(direction: str, bid: float, offer: float, audit_id: str,
@@ -570,6 +573,61 @@ def log_trade(record: Dict):
     df = pd.DataFrame([record])
     write_header = not LOG_FILE.exists()
     df.to_csv(LOG_FILE, mode="a", header=write_header, index=False)
+
+
+def update_stats_json(pnl_pips: float, quantity: float, close_price: float,
+                      ts: datetime):
+    """Update live_stats.json with daily/weekly/monthly/yearly net P&L.
+
+    commission_eur is deducted here (two fixed charges per round-trip).
+    gross_eur is converted from pips using the EURUSD close price.
+    net_eur = gross_eur - commission.
+    """
+    commission_eur = -abs((quantity / 1000.0) * COMMISSION_PER_1K_EUR)
+    gross_eur      = pnl_pips * quantity / 10000.0 / close_price if close_price else 0.0
+    net_eur        = gross_eur + commission_eur
+
+    day_key   = ts.strftime("%Y-%m-%d")
+    iso_cal   = ts.isocalendar()
+    week_key  = f"{iso_cal[0]}-W{iso_cal[1]:02d}"
+    month_key = ts.strftime("%Y-%m")
+    year_key  = ts.strftime("%Y")
+
+    with _stats_lock:
+        if STATS_FILE.exists():
+            try:
+                with open(STATS_FILE, encoding="utf-8") as f:
+                    stats = json.load(f)
+            except Exception:
+                stats = {}
+        else:
+            stats = {}
+
+        for section, key in [
+            ("daily", day_key), ("weekly", week_key),
+            ("monthly", month_key), ("yearly", year_key),
+        ]:
+            bucket = stats.setdefault(section, {})
+            entry  = bucket.setdefault(key, {
+                "trades": 0, "gross_pips": 0.0,
+                "commission_eur": 0.0, "net_eur": 0.0,
+            })
+            entry["trades"]         += 1
+            entry["gross_pips"]     = round(entry["gross_pips"]     + pnl_pips,       2)
+            entry["commission_eur"] = round(entry["commission_eur"] + commission_eur, 4)
+            entry["net_eur"]        = round(entry["net_eur"]        + net_eur,        4)
+
+        stats["last_updated"] = ts.isoformat()
+
+        temp = STATS_FILE.with_suffix(".tmp")
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, STATS_FILE)
+
+    log.debug("[STATS] day=%s  gross=%.2fp  comm=%.4f€  net=%.4f€",
+              day_key, pnl_pips, commission_eur, net_eur)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -799,6 +857,7 @@ def run(paper: bool = False):
         min_trail_lock_p=MIN_TRAIL_LOCK_PIPS,
         state_changed_fn=lambda: save_state(state),
         on_trade_close_fn=lambda direction, pnl: _update_reversal_strike(state, direction, pnl),
+        update_stats_fn=lambda pnl_pips, qty, close_px, ts: update_stats_json(pnl_pips, qty, close_px, ts),
     )
     _tick_monitor._reconnect_fn = ls_connect  # watchdog calls this on stale feed
     _tick_monitor.start()
@@ -916,6 +975,10 @@ def run(paper: bool = False):
                             f"day={risk_result['daily_realized_r']:+.2f}R  "
                             f"gate={'ARMED' if risk_result['gate_armed'] else 'clear'}"
                         )
+                    update_stats_json(pnl, float(QUANTITY), close_price,
+                                      datetime.now(timezone.utc))
+                _comm = -abs((QUANTITY / 1000.0) * COMMISSION_PER_1K_EUR)
+                _gross = round(pnl * QUANTITY / 10000.0 / close_price, 4) if close_price else 0.0
                 log_trade({
                     "type": "CLOSE",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -927,6 +990,9 @@ def run(paper: bool = False):
                     "entry_price": bs["entry_price"],
                     "close_price": round(close_price, 5),
                     "pnl_pips": round(pnl, 2),
+                    "commission_eur": round(_comm, 4),
+                    "gross_eur": _gross,
+                    "net_eur": round(_gross + _comm, 4),
                     "bars_held": bs.get("bars_held", 0) + bs["bars_in_bounce"],
                     "exit_reason": close_reason,
                     "entry_order_id": bs.get("order_id"),
@@ -1001,9 +1067,13 @@ def run(paper: bool = False):
                             f"day={risk_result['daily_realized_r']:+.2f}R  "
                             f"gate={'ARMED' if risk_result['gate_armed'] else 'clear'}"
                         )
+                    update_stats_json(pnl, float(QUANTITY), close_price,
+                                      datetime.now(timezone.utc))
                 else:
                     log.warning(f"  [EXIT] Close failed — keeping {key} in state")
 
+                _comm = -abs((QUANTITY / 1000.0) * COMMISSION_PER_1K_EUR)
+                _gross = round(pnl * QUANTITY / 10000.0 / close_price, 4) if close_price else 0.0
                 log_trade({
                     "type": "CLOSE",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1015,6 +1085,9 @@ def run(paper: bool = False):
                     "entry_price": trade["entry_price"],
                     "close_price": round(close_price, 5),
                     "pnl_pips": round(pnl, 2),
+                    "commission_eur": round(_comm, 4),
+                    "gross_eur": _gross,
+                    "net_eur": round(_gross + _comm, 4),
                     "bars_held": trade["bars_held"],
                     "exit_reason": reason,
                     "entry_order_id": trade.get("order_id"),

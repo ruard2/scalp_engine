@@ -35,6 +35,7 @@ from risk_controls import record_close as record_risk_close
 log = logging.getLogger("v6_engine")
 
 POLL_SECS = 0.5   # tick poll interval
+_COMMISSION_PER_1K_EUR = 0.10   # EUR per 1000-unit round-trip (CityIndex)
 
 
 class TickExitMonitor:
@@ -54,6 +55,7 @@ class TickExitMonitor:
         min_trail_lock_p:   float = 1.5,
         state_changed_fn:   Optional[Callable] = None,
         on_trade_close_fn:  Optional[Callable] = None,  # (direction, pnl) -> None
+        update_stats_fn:    Optional[Callable] = None,  # (pnl_pips, qty, close_px, ts) -> None
     ):
         self._state     = state
         self._lock      = lock
@@ -66,6 +68,7 @@ class TickExitMonitor:
         self._paper     = paper
         self._state_changed  = state_changed_fn  or (lambda: None)
         self._on_trade_close = on_trade_close_fn or (lambda d, p: None)
+        self._update_stats   = update_stats_fn   or (lambda pnl, qty, px, ts: None)
 
         # Bounce parameters (in price units)
         self._safety_d      = bounce_safety_p  / 10000
@@ -395,12 +398,19 @@ class TickExitMonitor:
                     "ARMED" if risk_result["gate_armed"] else "clear",
                 )
                 self._state_changed()
+                self._update_stats(pnl, self._qty, close_px,
+                                   datetime.now(timezone.utc))
             self._close_retry_after.pop(key, None)
             self._pending_close_reason.pop(key, None)
+            _comm  = -abs((self._qty / 1000.0) * _COMMISSION_PER_1K_EUR)
+            _gross = round(pnl * self._qty / 10000.0 / close_px, 4) if close_px else 0.0
             self._log_trade({
                 "type": "CLOSE", "timestamp": now_iso,
                 "combo_key": key, "direction": d,
                 "reason": reason, "pnl_pips": round(pnl, 2),
+                "commission_eur": round(_comm, 4),
+                "gross_eur": _gross,
+                "net_eur": round(_gross + _comm, 4),
                 "close_price": round(close_px, 5),
                 "bars_held": t.get("bars_held", 0),
                 "source": "tick",
@@ -540,12 +550,19 @@ class TickExitMonitor:
                     "ARMED" if risk_result["gate_armed"] else "clear",
                 )
                 self._state_changed()
+                self._update_stats(pnl, self._qty, close_px,
+                                   datetime.now(timezone.utc))
             self._close_retry_after.pop(bkey, None)
             self._pending_close_reason.pop(bkey, None)
+            _comm  = -abs((self._qty / 1000.0) * _COMMISSION_PER_1K_EUR)
+            _gross = round(pnl * self._qty / 10000.0 / close_px, 4) if close_px else 0.0
             self._log_trade({
                 "type": "CLOSE", "timestamp": now_iso,
                 "combo_key": bkey, "direction": d,
                 "reason": reason, "pnl_pips": round(pnl, 2),
+                "commission_eur": round(_comm, 4),
+                "gross_eur": _gross,
+                "net_eur": round(_gross + _comm, 4),
                 "close_price": round(close_px, 5),
                 "bars_held": bs.get("bars_held", 0),
                 "source": "tick",
