@@ -746,6 +746,34 @@ def print_dashboard(classified: pd.DataFrame, open_trades: Dict,
             print(f"  {key:<40} {entry:.5f} {bars:>5} {sf:.5f} {bnc:>7}")
 
     print()
+
+    # ── Net P&L stats (from live_stats.json) ─────────────────────────────
+    try:
+        if STATS_FILE.exists():
+            with open(STATS_FILE, encoding="utf-8") as _sf:
+                _st = json.load(_sf)
+            now_utc2   = datetime.now(timezone.utc)
+            _day_key   = now_utc2.strftime("%Y-%m-%d")
+            _iso       = now_utc2.isocalendar()
+            _week_key  = f"{_iso[0]}-W{_iso[1]:02d}"
+            _month_key = now_utc2.strftime("%Y-%m")
+            _year_key  = now_utc2.strftime("%Y")
+            def _fmt(section, key):
+                e = _st.get(section, {}).get(key)
+                if not e:
+                    return "n/a"
+                return (f"{e['net_eur']:+.2f}€ net  "
+                        f"({e['trades']}tr  gross={e.get('gross_eur', e.get('gross_pips', 0)):+.2f}€  "
+                        f"comm={e['commission_eur']:+.2f}€)")
+            print(f"  NET P&L")
+            print(f"    Today  {_day_key:<12}: {_fmt('daily',   _day_key)}")
+            print(f"    Week   {_week_key:<12}: {_fmt('weekly',  _week_key)}")
+            print(f"    Month  {_month_key:<12}: {_fmt('monthly', _month_key)}")
+            print(f"    Year   {_year_key:<12}: {_fmt('yearly',  _year_key)}")
+            print()
+    except Exception:
+        pass
+
     print("  * PnL = unrealised pips at current close price")
     print("=" * 65)
 
